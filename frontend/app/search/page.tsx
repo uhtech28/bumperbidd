@@ -4,12 +4,17 @@
  * Search page — filters + trigram suggest.
  * Keeps filter state in URL so results are shareable.
  * Uses server-side Postgres FTS + pg_trgm (see backend/search module).
+ *
+ * `dynamic = 'force-dynamic'` skips static prerender (the page reads
+ * `useSearchParams()` which can't be statically generated anyway).
  */
 import { Suspense, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { searchApi, ApiError, type Auction, type SearchFilters } from '../../lib/api';
 import { formatINR } from '../../lib/format';
+
+export const dynamic = 'force-dynamic';
 
 const FUELS: SearchFilters['fuelType'][] = ['petrol', 'diesel', 'ev', 'cng', 'hybrid'];
 
