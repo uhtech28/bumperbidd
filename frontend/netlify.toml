@@ -1,0 +1,17 @@
+# Netlify build config for Next.js 14 App Router.
+#
+# The @netlify/plugin-nextjs plugin transforms the .next build output
+# into Netlify Functions + Edge Functions for full SSR/RSC support.
+# Without this, only fully static pages get served and any dynamic
+# route (e.g. /auth, /dashboard) returns Netlify's 404.
+
+[build]
+  command   = "npm run build"
+  publish   = ".next"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+# Force Node 20 to match local dev and avoid deprecation issues.
+[build.environment]
+  NODE_VERSION = "20"
