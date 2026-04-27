@@ -20,6 +20,9 @@ export interface Auction {
   status: AuctionStatus;
   gradient: [string, string];
   tag?: 'Featured' | 'Hot' | 'Ending soon' | 'New';
+  // Real auction photos (R2 / CDN URLs). When empty/undefined, VehicleThumb
+  // falls back to the gradient placeholder.
+  imageUrls?: string[];
 }
 
 export interface RecentBid {

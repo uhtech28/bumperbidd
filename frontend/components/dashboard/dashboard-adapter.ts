@@ -96,6 +96,7 @@ export function toUiAuction(
     status: uiStatus,
     gradient: gradientFor(category),
     tag: tagFor(a, allEndsAt),
+    imageUrls: a.vehicle.imageUrls ?? [],
   };
 }
 
