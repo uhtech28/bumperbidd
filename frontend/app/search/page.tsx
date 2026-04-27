@@ -5,7 +5,7 @@
  * Keeps filter state in URL so results are shareable.
  * Uses server-side Postgres FTS + pg_trgm (see backend/search module).
  */
-import { useEffect, useMemo, useState } from 'react';
+import { Suspense, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { searchApi, ApiError, type Auction, type SearchFilters } from '../../lib/api';
@@ -13,7 +13,27 @@ import { formatINR } from '../../lib/format';
 
 const FUELS: SearchFilters['fuelType'][] = ['petrol', 'diesel', 'ev', 'cng', 'hybrid'];
 
+/**
+ * Next.js 14 requires components that read URL search params to be wrapped
+ * in a <Suspense> boundary so they can defer rendering during static export.
+ * The inner component does the actual work; the default export is just the
+ * boundary wrapper.
+ */
 export default function SearchPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="mx-auto max-w-7xl px-4 py-8 text-sm text-neutral-500">
+          Loading search…
+        </div>
+      }
+    >
+      <SearchPageInner />
+    </Suspense>
+  );
+}
+
+function SearchPageInner() {
   const router = useRouter();
   const sp = useSearchParams();
   const [items, setItems] = useState<Auction[]>([]);
