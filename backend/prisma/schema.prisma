@@ -1,0 +1,613 @@
+// Prisma schema — BumperBid production auction platform.
+//
+// Domains:
+//   User         — unified identity (phone OR email, never duplicate)
+//   Auction      — listing with lifecycle (scheduled → live → ended)
+//   Bid          — immutable append-only history (every bid ever placed)
+//   Wallet       — per-user balance + ledger entries (double-entry)
+//   WalletEntry  — immutable ledger (credits, debits, holds, releases)
+//   WalletHold   — active funds hold for a live bid (released on outbid)
+//   Notification — in-app notifications for outbid/won/ended
+//
+// All monetary values are stored as INT PAISA (1 INR = 100 paisa). We
+// never use FLOAT for money — floating-point rounding will bite you.
+// Every money table has a CHECK constraint enforcing amount >= 0 where
+// applicable (Prisma doesn't support CHECK directly — see migration SQL).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum AuthProvider {
+  phone
+  email
+  both
+}
+
+enum AuctionStatus {
+  scheduled   // created, not yet live
+  live        // accepting bids now
+  ended       // timer elapsed, winner determined
+  cancelled   // seller or admin cancelled
+}
+
+enum WalletEntryType {
+  credit          // top-up (Razorpay etc.)
+  debit           // auction won, debited
+  hold            // funds reserved for active bid
+  release         // hold released (outbid or auction cancelled)
+  refund          // admin refund
+  adjustment      // manual correction
+}
+
+enum HoldStatus {
+  active          // currently holding funds for a live bid
+  released        // outbid or auction cancelled — funds returned
+  captured        // auction won — hold converted to debit
+}
+
+enum NotificationType {
+  outbid
+  auction_ending_soon
+  auction_won
+  auction_lost
+  auction_cancelled
+  wallet_credited
+  wallet_debited
+}
+
+// ---------------------------------------------------------------------------
+// Users
+// ---------------------------------------------------------------------------
+
+model User {
+  id             String       @id @default(uuid()) @db.Uuid
+  phone          String?      @unique
+  email          String?      @unique
+  passwordHash   String?
+  provider       AuthProvider
+  displayName    String?
+  // Optional public profile photo. Stored as the canonical public URL
+  // returned by the uploads service so the frontend can render directly.
+  profilePhotoUrl String?
+  // Optional short bio surfaced on seller profiles.
+  bio            String?
+  emailVerified  Boolean      @default(false)
+  phoneVerified  Boolean      @default(true)
+  role           UserRole     @default(user)
+  bannedAt       DateTime?
+  banReason      String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  lastLoginAt    DateTime     @default(now())
+
+  // relations
+  wallet         Wallet?
+  bids           Bid[]
+  auctionsAsSeller  Auction[] @relation("seller")
+  auctionsAsWinner  Auction[] @relation("winner")
+  notifications  Notification[]
+  kycProfile     KycProfile?
+
+  @@index([phone])
+  @@index([email])
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Auctions
+// ---------------------------------------------------------------------------
+
+model Auction {
+  id                  String         @id @default(uuid()) @db.Uuid
+  title               String
+  description         String         @db.Text
+  // vehicle metadata (flattened for perf — dedicated table would be overkill here)
+  make                String
+  modelName           String
+  year                Int
+  kmDriven            Int
+  fuelType            String         // "petrol" | "diesel" | "ev" | "cng" | "hybrid"
+  ownerCount          Int            @default(1)
+  city                String
+  imageUrls           String[]       // S3 keys or URLs
+  // Vehicle-papers metadata. All optional during dev rollout; admin
+  // review enforces presence on a per-listing basis later.
+  registrationNumber  String?        // e.g. "KA-01-AB-1234"
+  chassisNumber       String?        // 17-char VIN
+  engineNumber        String?
+  transmission        String?        // "manual" | "automatic" | "cvt" | "amt"
+  bodyType            String?        // "sedan" | "hatchback" | "suv" | "muv" | "coupe" | "ev" | ...
+  color               String?
+  manufactureMonth    String?        // "MM/YYYY" for human-friendly display
+  insuranceValidUntil DateTime?
+  pucValidUntil       DateTime?
+  loanStatus          String?        // "clear" | "hypothecated"
+  // pricing — all in paisa
+  startingPrice       Int            // min acceptable bid
+  minIncrement        Int            // min step between consecutive bids
+  reservePrice        Int?           // hidden min — below this auction ends without winner
+  // lifecycle
+  status              AuctionStatus  @default(scheduled)
+  startsAt            DateTime
+  endsAt              DateTime
+  // Listing review queue. New auctions land in `pending`; the lifecycle
+  // scheduler ignores them until an admin flips reviewStatus to `approved`.
+  reviewStatus        String         @default("approved") // "pending" | "approved" | "rejected"
+  reviewedAt          DateTime?
+  reviewedById        String?        @db.Uuid
+  reviewNote          String?
+  // live state (mirror of Redis — Redis is source of truth during live)
+  currentHighBid      Int?
+  currentHighBidderId String?        @db.Uuid
+  searchText          String?        @db.Text
+  bidCount            Int            @default(0)
+  // outcome
+  winnerId            String?        @db.Uuid
+  finalPrice          Int?
+  endedAt             DateTime?
+  // relations
+  sellerId            String         @db.Uuid
+  seller              User           @relation("seller", fields: [sellerId], references: [id])
+  winner              User?          @relation("winner", fields: [winnerId], references: [id])
+  bids                Bid[]
+  holds               WalletHold[]
+  orders              Order[]
+
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  @@index([status, endsAt])
+  @@index([reviewStatus, createdAt])
+  @@index([sellerId])
+  @@index([winnerId])
+  @@index([startsAt])
+  @@map("auctions")
+}
+
+// ---------------------------------------------------------------------------
+// Orders & disputes - the post-auction lifecycle.
+//
+// When an auction ends with a winner above reserve, the lifecycle
+// scheduler creates an Order. The Order tracks payment, delivery,
+// escrow release, and any disputes raised after delivery.
+// ---------------------------------------------------------------------------
+
+model Order {
+  id                  String         @id @default(uuid()) @db.Uuid
+  auctionId           String         @db.Uuid
+  buyerId             String         @db.Uuid
+  sellerId            String         @db.Uuid
+  finalPrice          Int            // paisa, snapshot of winning bid
+  paymentStatus       String         @default("pending") // pending|paid|failed|refunded
+  paymentRef          String?
+  deliveryStatus      String         @default("scheduled") // scheduled|in_transit|delivered|disputed|cancelled
+  scheduledFor        DateTime?
+  deliveredAt         DateTime?
+  escrowReleasedAt    DateTime?
+  cancelledAt         DateTime?
+  cancelReason        String?
+  notes               String?
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  auction             Auction        @relation(fields: [auctionId], references: [id])
+  disputes            Dispute[]
+
+  @@index([buyerId, createdAt(sort: Desc)])
+  @@index([sellerId, createdAt(sort: Desc)])
+  @@index([paymentStatus])
+  @@index([deliveryStatus])
+  @@map("orders")
+}
+
+model Dispute {
+  id                  String         @id @default(uuid()) @db.Uuid
+  orderId             String         @db.Uuid
+  raisedById          String         @db.Uuid
+  reason              String         // short tag: "damage" | "not_as_described" | "title_issue" | "other"
+  details             String         @db.Text
+  evidenceUrls        String[]
+  status              String         @default("open") // open|under_review|resolved_buyer|resolved_seller|closed
+  adminNotes          String?
+  resolvedAt          DateTime?
+  resolvedById        String?        @db.Uuid
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  order               Order          @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@index([status, createdAt(sort: Desc)])
+  @@map("disputes")
+}
+
+// ---------------------------------------------------------------------------
+// Bids — append-only history
+// ---------------------------------------------------------------------------
+
+model Bid {
+  id         String   @id @default(uuid()) @db.Uuid
+  auctionId  String   @db.Uuid
+  userId     String   @db.Uuid
+  amount     Int      // paisa
+  placedAt   DateTime @default(now())
+
+  auction    Auction  @relation(fields: [auctionId], references: [id], onDelete: Cascade)
+  user       User     @relation(fields: [userId], references: [id])
+
+  @@index([auctionId, placedAt(sort: Desc)])
+  @@index([userId, placedAt(sort: Desc)])
+  @@map("bids")
+}
+
+// ---------------------------------------------------------------------------
+// Wallet — balance is cached from ledger; ledger is source of truth
+// ---------------------------------------------------------------------------
+
+model Wallet {
+  id             String        @id @default(uuid()) @db.Uuid
+  userId         String        @unique @db.Uuid
+  balance        Int           @default(0)  // available (not held) — paisa
+  heldBalance    Int           @default(0)  // currently held by active bids
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  entries        WalletEntry[]
+  holds          WalletHold[]
+
+  @@index([userId])
+  @@map("wallets")
+}
+
+model WalletEntry {
+  id             String          @id @default(uuid()) @db.Uuid
+  walletId       String          @db.Uuid
+  type           WalletEntryType
+  amount         Int             // always positive — type tells you direction
+  balanceAfter   Int             // balance snapshot post-entry (for audit)
+  // dedupe / idempotency
+  idempotencyKey String?         @unique
+  // optional references
+  referenceType  String?         // "auction" | "bid" | "hold" | "razorpay" ...
+  referenceId    String?
+  note           String?
+  createdAt      DateTime        @default(now())
+
+  wallet         Wallet          @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  @@index([walletId, createdAt(sort: Desc)])
+  @@index([referenceType, referenceId])
+  @@map("wallet_entries")
+}
+
+model WalletHold {
+  id         String     @id @default(uuid()) @db.Uuid
+  walletId   String     @db.Uuid
+  auctionId  String     @db.Uuid
+  amount     Int        // paisa
+  status     HoldStatus @default(active)
+  createdAt  DateTime   @default(now())
+  resolvedAt DateTime?
+
+  wallet     Wallet     @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  auction    Auction    @relation(fields: [auctionId], references: [id], onDelete: Cascade)
+
+  @@unique([walletId, auctionId, status])  // only one active hold per (user, auction)
+  @@index([status])
+  @@index([auctionId, status])
+  @@map("wallet_holds")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id         String           @id @default(uuid()) @db.Uuid
+  userId     String           @db.Uuid
+  type       NotificationType
+  title      String
+  body       String
+  // optional refs
+  auctionId  String?          @db.Uuid
+  meta       Json?
+  readAt     DateTime?
+  createdAt  DateTime         @default(now())
+
+  user       User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// KYC — mandatory for sellers, optional for buyers
+// ---------------------------------------------------------------------------
+
+enum KycStatus {
+  not_started
+  pending
+  approved
+  rejected
+}
+
+enum KycDocType {
+  pan
+  aadhaar
+  driving_license
+  passport
+}
+
+model KycProfile {
+  id             String     @id @default(uuid()) @db.Uuid
+  userId         String     @unique @db.Uuid
+  fullName       String
+  dob            DateTime?
+  panNumber      String?    @unique
+  aadhaarLast4   String?
+  addressLine1   String?
+  addressLine2   String?
+  city           String?
+  state          String?
+  pincode        String?
+  status         KycStatus  @default(pending)
+  reviewerId     String?    @db.Uuid
+  reviewedAt     DateTime?
+  rejectionNote  String?
+  submittedAt    DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  user           User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documents      KycDocument[]
+
+  @@index([status])
+  @@map("kyc_profiles")
+}
+
+model KycDocument {
+  id          String     @id @default(uuid()) @db.Uuid
+  profileId   String     @db.Uuid
+  docType     KycDocType
+  fileKey     String     // R2 object key
+  mimeType    String
+  sizeBytes   Int
+  uploadedAt  DateTime   @default(now())
+
+  profile     KycProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId])
+  @@map("kyc_documents")
+}
+
+// ---------------------------------------------------------------------------
+// Vehicle images — moderated by AWS Rekognition
+// ---------------------------------------------------------------------------
+
+enum ImageModerationStatus {
+  pending
+  approved
+  rejected
+  errored
+}
+
+model VehicleImage {
+  id             String                @id @default(uuid()) @db.Uuid
+  auctionId      String                @db.Uuid
+  uploaderId     String                @db.Uuid
+  fileKey        String                @unique  // R2 object key
+  publicUrl      String
+  width          Int?
+  height         Int?
+  sizeBytes      Int
+  mimeType       String
+  sortOrder      Int                   @default(0)
+  moderation     ImageModerationStatus @default(pending)
+  moderationNote String?
+  createdAt      DateTime              @default(now())
+
+  @@index([auctionId, sortOrder])
+  @@index([moderation])
+  @@map("vehicle_images")
+}
+
+// ---------------------------------------------------------------------------
+// Watchlist / favorites
+// ---------------------------------------------------------------------------
+
+model Watchlist {
+  userId     String   @db.Uuid
+  auctionId  String   @db.Uuid
+  createdAt  DateTime @default(now())
+
+  @@id([userId, auctionId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([auctionId])
+  @@map("watchlists")
+}
+
+// ---------------------------------------------------------------------------
+// Proxy / auto-bid — user declares max, system auto-increments
+// ---------------------------------------------------------------------------
+
+model ProxyBid {
+  id         String   @id @default(uuid()) @db.Uuid
+  auctionId  String   @db.Uuid
+  userId     String   @db.Uuid
+  maxAmount  Int      // paisa — highest user is willing to pay
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([auctionId, userId])
+  @@index([auctionId, active])
+  @@map("proxy_bids")
+}
+
+// ---------------------------------------------------------------------------
+// Payment proofs — users upload QR screenshot, admin approves
+// ---------------------------------------------------------------------------
+
+enum PaymentProofStatus {
+  pending
+  approved
+  rejected
+}
+
+model PaymentProof {
+  id             String             @id @default(uuid()) @db.Uuid
+  userId         String             @db.Uuid
+  amount         Int                // paisa requested
+  utrReference   String?            // UPI / bank reference number
+  fileKey        String             // R2 object key of screenshot
+  status         PaymentProofStatus @default(pending)
+  reviewerId     String?            @db.Uuid
+  reviewedAt     DateTime?
+  rejectionNote  String?
+  creditedEntryId String?           @db.Uuid  // WalletEntry id once approved
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status, createdAt])
+  @@map("payment_proofs")
+}
+
+// ---------------------------------------------------------------------------
+// Admin audit log — every sensitive action recorded
+// ---------------------------------------------------------------------------
+
+model AdminAuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  adminId    String   @db.Uuid
+  action     String   // "user.ban", "payment.approve", "auction.cancel", ...
+  targetType String?  // "user" | "auction" | "payment" ...
+  targetId   String?
+  diff       Json?    // before/after snapshot
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([adminId, createdAt(sort: Desc)])
+  @@index([targetType, targetId])
+  @@index([action, createdAt(sort: Desc)])
+  @@map("admin_audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// User sessions — device management, logout-all-devices
+// ---------------------------------------------------------------------------
+
+model UserSession {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @db.Uuid
+  refreshJti   String   @unique
+  userAgent    String?
+  ip           String?
+  device       String?
+  createdAt    DateTime @default(now())
+  lastSeenAt   DateTime @default(now())
+  revokedAt    DateTime?
+  expiresAt    DateTime
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([refreshJti])
+  @@map("user_sessions")
+}
+
+// ---------------------------------------------------------------------------
+// Password reset tokens.
+//
+// Raw token (cryptographic random, sent in email link) is never stored.
+// We persist sha256(token) so a DB leak doesn't compromise the link.
+// One outstanding token per user; expires in 1h; usedAt records consumption.
+// ---------------------------------------------------------------------------
+
+model PasswordResetToken {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @db.Uuid
+  tokenHash   String    @unique
+  expiresAt   DateTime
+  usedAt      DateTime?
+  createdAt   DateTime  @default(now())
+  ip          String?
+  userAgent   String?
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("password_reset_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Push notification tokens (FCM + Web Push)
+// ---------------------------------------------------------------------------
+
+enum PushChannel {
+  fcm_android
+  fcm_ios
+  web_push
+}
+
+model PushToken {
+  id         String      @id @default(uuid()) @db.Uuid
+  userId     String      @db.Uuid
+  channel    PushChannel
+  token      String      @unique
+  createdAt  DateTime    @default(now())
+  lastSeenAt DateTime    @default(now())
+
+  @@index([userId, channel])
+  @@map("push_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Email events (outbound audit + resend state)
+// ---------------------------------------------------------------------------
+
+enum EmailStatus {
+  queued
+  sent
+  failed
+  bounced
+  opened
+}
+
+model EmailEvent {
+  id         String      @id @default(uuid()) @db.Uuid
+  userId     String?     @db.Uuid
+  toAddress  String
+  template   String
+  subject    String
+  providerId String?     // Resend message ID
+  status     EmailStatus @default(queued)
+  error      String?
+  meta       Json?
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status, createdAt])
+  @@map("email_events")
+}
+
+// ---------------------------------------------------------------------------
+// User roles — simple enum (fine for single-team platforms; switch to RBAC later)
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  user
+  seller
+  admin
+  support
+}

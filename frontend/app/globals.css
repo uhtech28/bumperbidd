@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html, body {
+  height: 100%;
+  background: radial-gradient(120% 80% at 50% 0%, #0a0a0a 0%, #000 55%);
+  color: #f8f8f5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* Prevent mobile pull-to-refresh bounce from revealing overscroll colour */
+  overscroll-behavior: none;
+}
+
+/* Auth screens are locked to 100dvh — forbid any stray document scroll. */
+body:has(main.fixed) {
+  overflow: hidden;
+  position: fixed;
+  inset: 0;
+}
+
+/* Premium gold gradient used for the BUMPERBID wordmark */
+.text-gold-grad {
+  background: linear-gradient(180deg, #FFE27A 0%, #D4A017 55%, #8E6908 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Thin gold divider */
+.gold-divider {
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(212, 160, 23, 0.15) 15%,
+    rgba(212, 160, 23, 0.9) 50%,
+    rgba(212, 160, 23, 0.15) 85%,
+    transparent 100%
+  );
+}
+
+/* Input caret / focus treatment matches brand gold */
+.otp-caret:focus {
+  outline: none;
+  border-color: #D4A017;
+  box-shadow: 0 0 0 2px rgba(212, 160, 23, 0.25);
+}
+
+/* Hide Chrome number-input spinners on phone field */
+input[type='tel']::-webkit-outer-spin-button,
+input[type='tel']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}

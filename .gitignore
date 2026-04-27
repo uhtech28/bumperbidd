@@ -1,0 +1,82 @@
+# =============================================================================
+# Secrets — NEVER commit these. Hosted-deploy env vars go in Railway/Vercel UI.
+# =============================================================================
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+*.pem
+*.key
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+node_modules/
+.pnpm-store/
+
+# =============================================================================
+# Build outputs
+# =============================================================================
+# Next.js
+.next/
+out/
+
+# NestJS / TypeScript
+dist/
+build/
+*.tsbuildinfo
+
+# Prisma generated client (regenerated on each `prisma generate`)
+backend/node_modules/.prisma/
+
+# =============================================================================
+# Logs
+# =============================================================================
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# =============================================================================
+# Editor / IDE
+# =============================================================================
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# =============================================================================
+# OS junk
+# =============================================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# =============================================================================
+# Test / coverage
+# =============================================================================
+coverage/
+.nyc_output/
+
+# =============================================================================
+# Misc local runtime files
+# =============================================================================
+*.tmp
+*.temp
+.cache/
+.turbo/
+.parcel-cache/
+
+# Uploaded local fixtures (MinIO data dir if mounted under repo)
+minio-data/
+postgres-data/
+redis-data/
+
+# Cowork / agent session output (if any)
+outputs/
